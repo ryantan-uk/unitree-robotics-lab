@@ -1,0 +1,30 @@
+# Nav2 全局规划器 (planner_server) 及其代价地图。只包含 "给定起点终点，在地图上算一条路" 所需的部分。
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 5.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      tolerance: 0.3
+      use_astar: false
+      allow_unknown: true
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_link
+      robot_radius: 0.35            # Go2 机身约 0.70 x 0.31 m，取外接圆半径；G1 可取 0.30
+      resolution: 0.05
+      track_unknown_space: true
+      always_send_full_costmap: true
+      plugins: ["static_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: true      # slam_toolbox 的 /map 是 transient_local
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.55     # 离障碍物这么远以内的格子都有代价，路径会被"推离"墙面

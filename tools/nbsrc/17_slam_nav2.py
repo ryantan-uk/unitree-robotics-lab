@@ -1,0 +1,304 @@
+# %% [markdown]
+# # 17 · 画一张地图，再问"从这儿到那儿怎么走"
+#
+# **Part 3 做出完整应用 · 第 5 节**
+#
+# 上一节把点云变到世界系后，已经能隐约看出房间的轮廓。这一节把它做成正经的东西：
+#
+# 1. **SLAM**（同时定位与建图）：机器人边走边看，把一路的激光拼成一张**栅格地图**；
+# 2. **Nav2 规划**：在这张地图上，给起点和终点，算出一条不撞墙的路。
+#
+# 数据：`data/bags/go2_slam`（**合成**）——Go2 绕一个 8 m × 6 m、带一道隔墙和一个箱子的房间走了一圈，约 45 秒。
+#
+# 学完你能：
+# 1. 说出"点云 → 激光 → 地图"每一步是谁做的、需要哪些 TF；
+# 2. 用 `use_sim_time` 正确地在回放数据上跑建图；
+# 3. 读懂栅格地图的数据结构，并用程序评价地图质量；
+# 4. 调用 Nav2 的规划器得到路径，解释路径为什么不是直线、为什么离墙有距离。
+#
+# > **本节验证到哪一步**：建图和规划都能在回放数据上完整运行。让机器人**沿着规划出的路走过去**（Nav2 的控制器闭环）需要一台会动的机器人，
+# > 属于真机待验项，步骤在本节末尾。
+
+# %%
+LIVE = False
+
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.action import ActionClient
+
+from common import connect, Background, play_bag, REPO
+from common.plotting import plot_room, room_walls
+from common.rosutil import ros_init, sh, spin_for
+
+lab = connect("go2", live=LIVE, sdk=False, bag=None)      # 这一节自己控制回放 (要用仿真时间)
+ros_init()
+
+# %% [markdown]
+# ## 1. 先跑通：启动整条流水线，放数据，等地图
+#
+# ```
+#  /utlidar/cloud ─▶ cloud_to_scan ─▶ /scan ─┐
+#   (三维点云)        (切一层变二维)            ├─▶ slam_toolbox ─▶ /map (栅格地图)
+#  /sportmodestate ─▶ robot_bridge ─▶ TF: odom→base_link ─┘        └▶ TF: map→odom (修正里程计漂移)
+#                                                                  /map ─▶ Nav2 planner_server ─▶ 路径
+# ```
+#
+# 这些节点都在课程的 launch 文件里，加上 `slam:=true nav:=true` 就一起启动。参数文件是 `config/slam_toolbox.yaml` 和 `config/nav2_planner.yaml`。
+#
+# **`use_sim_time:=true`**：15 节讲过，回放旧数据时必须让所有节点用 bag 里的时间，否则 slam_toolbox 会因为"激光的时间戳和 TF 对不上"丢掉每一帧。
+
+# %%
+SIM = "false" if LIVE else "true"
+LOW = "/lowstate" if LIVE else "/lf/lowstate"            # go2_slam 这段数据只录了低频状态 (15 节的表: 长时间录制用 /lf/lowstate)
+stack = Background(f"exec ros2 launch unitree_lab_nodes stack.launch.py robot:=go2 use_sim_time:={SIM} lowstate_topic:={LOW} slam:=true nav:=true",
+                   log="/tmp/unitree_lab_stack17.log")
+assert stack.wait_for("bridge up", 60), stack.output()
+time.sleep(8.0)                                                    # 等 slam_toolbox 和 planner_server 起来
+
+from nav_msgs.msg import OccupancyGrid, Odometry
+from sensor_msgs.msg import LaserScan
+
+me = Node("student")
+maps, odom_xy, scans = [], [], []
+MAP_QOS = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
+map_sub = me.create_subscription(OccupancyGrid, "/map", lambda m: maps.append((time.monotonic(), m)), MAP_QOS)
+me.create_subscription(Odometry, "/odom", lambda m: odom_xy.append((m.pose.pose.position.x, m.pose.pose.position.y)), 50)
+me.create_subscription(LaserScan, "/scan", lambda m: scans.append(m), qos_profile_sensor_data)
+
+t_start = time.monotonic()
+player = None if LIVE else play_bag("go2_slam", extra="--clock")    # --clock: 同时发布 /clock
+spin_for(me, 28.0)                                                  # 机器人此时走了大半圈
+print(f"{time.monotonic() - t_start:.0f} s: 收到 {len(scans)} 帧 /scan, {len(odom_xy)} 条 /odom, {len(maps)} 版 /map")
+
+# %% [markdown]
+# `/map` 的 QoS 是 `TRANSIENT_LOCAL`（"晚来的订阅者也能拿到最后一版"，01 节见过这个词）——地图几秒才更新一次，新启动的节点不该干等。
+#
+# ## 2. 在已经建好的那部分地图上规划
+#
+# 趁数据还在放（时钟还在走），先调用 Nav2 的规划器。它提供的是一个 **Action**（04 节）：`/compute_path_to_pose`。
+
+# %%
+from nav2_msgs.action import ComputePathToPose
+
+planner = ActionClient(me, ComputePathToPose, "compute_path_to_pose")
+assert planner.wait_for_server(timeout_sec=20.0), stack.output(tail=15)
+
+
+def plan(start, goal, timeout=15.0):
+    """在 map 坐标系里从 start=(x,y) 规划到 goal=(x,y)。返回 (N,2) 的路径；失败返回 None。"""
+    g = ComputePathToPose.Goal()
+    g.use_start = True                                    # 用我们给的起点，而不是机器人当前位置
+    g.start.header.frame_id = g.goal.header.frame_id = "map"
+    g.start.pose.position.x, g.start.pose.position.y = map(float, start)
+    g.goal.pose.position.x, g.goal.pose.position.y = map(float, goal)
+    g.start.pose.orientation.w = g.goal.pose.orientation.w = 1.0
+    f = planner.send_goal_async(g)
+    rclpy.spin_until_future_complete(me, f, timeout_sec=timeout)
+    handle = f.result()
+    if handle is None or not handle.accepted:
+        return None
+    rf = handle.get_result_async()
+    rclpy.spin_until_future_complete(me, rf, timeout_sec=timeout)
+    res = rf.result()
+    if res is None or res.status != 4 or not res.result.path.poses:          # 4 = SUCCEEDED
+        return None
+    return np.array([[p.pose.position.x, p.pose.position.y] for p in res.result.path.poses])
+
+
+def length(path):
+    return float(np.hypot(*np.diff(path, axis=0).T).sum())
+
+
+GOALS = {"A: across the room": ((0.0, 0.0), (5.2, 2.8)),
+         "B: behind the partition": ((0.0, 0.0), (3.2, -1.8)),
+         "C: inside the box": ((0.0, 0.0), (4.1, 1.7)),
+         "D: outside the room": ((0.0, 0.0), (9.0, 0.5))}
+paths = {}
+for name, (s, g) in GOALS.items():
+    p = plan(s, g)
+    paths[name] = p
+    straight = float(np.hypot(g[0] - s[0], g[1] - s[1]))
+    print(f"{name:<26} 直线距离 {straight:.2f} m -> " + ("规划失败" if p is None else
+          f"路径 {length(p):.2f} m, {len(p)} 个点, 终点离目标 {np.hypot(*(p[-1] - g)):.2f} m"))
+
+# 让数据放完，拿到最终的地图
+spin_for(me, max(0.0, 47.0 - (time.monotonic() - t_start)))
+print(f"共收到 {len(maps)} 版地图")
+if player:
+    player.stop()
+
+# %% [markdown]
+# ## 3. 拆开：地图是什么
+#
+# `nav_msgs/OccupancyGrid` 就是一张灰度图加一段说明：
+
+# %%
+def grid(m):
+    """OccupancyGrid -> (二维数组, 画图用的范围 [x0, x1, y0, y1])"""
+    a = np.array(m.data, dtype=np.int8).reshape(m.info.height, m.info.width)
+    x0, y0, r = m.info.origin.position.x, m.info.origin.position.y, m.info.resolution
+    return a, [x0, x0 + m.info.width * r, y0, y0 + m.info.height * r]
+
+
+final = maps[-1][1]
+a, extent = grid(final)
+print(f"尺寸 {final.info.width} x {final.info.height} 格, 分辨率 {final.info.resolution} m/格 -> {final.info.width * final.info.resolution:.1f} m x {final.info.height * final.info.resolution:.1f} m")
+print(f"原点 (左下角) 在 map 系的 ({final.info.origin.position.x:.2f}, {final.info.origin.position.y:.2f})")
+print(f"格子的值: -1 未知 {np.mean(a < 0):.0%} | 0 空闲 {np.mean(a == 0):.0%} | 100 占据 {np.mean(a > 50):.1%}")
+
+# %% [markdown]
+# 看它是怎么"长"出来的——取开始、中间、最后三版：
+
+# %%
+def show(ax, m, title):
+    a, extent = grid(m)
+    img = np.where(a < 0, 0.6, np.where(a > 50, 0.0, 1.0))           # 未知=灰, 占据=黑, 空闲=白
+    ax.imshow(img, origin="lower", extent=extent, cmap="gray", vmin=0, vmax=1)
+    ax.set(title=title, xlabel="x [m]", ylabel="y [m]"); ax.set_aspect("equal")
+
+
+picks = [maps[0], maps[len(maps) // 3], maps[-1]]
+fig, ax = plt.subplots(1, 3, figsize=(13, 3.6))
+for a_, (tm, m) in zip(ax, picks):
+    show(a_, m, f"map at t = {tm - t_start:.0f} s")
+xy = np.array(odom_xy)
+ax[2].plot(xy[:, 0], xy[:, 1], "b-", lw=1, label="odometry path"); ax[2].legend(fontsize=7)
+plt.tight_layout(); plt.show()
+
+# %% [markdown]
+# **对着三张图回答：**
+# 1. 第一版地图里，隔墙后面和箱子后面是灰色（未知）。为什么？到哪一版才变白？
+# 2. 机器人自己走过的地方是什么颜色？
+# 3. 蓝线是里程计给的路径——它**没有**参与决定墙画在哪吗？（参与了：slam_toolbox 用里程计做初值，再用激光匹配修正。）
+#
+# ### 用程序评价地图：和真值比
+#
+# 合成数据的好处是我们知道房间的真实形状（`data/room.json`）。把真实墙面上每隔 5 cm 取一个点，看地图在它附近有没有画出"占据"：
+
+# %%
+def wall_points(step=0.05):
+    pts = []
+    for x1, y1, x2, y2 in room_walls():
+        n = max(2, int(np.hypot(x2 - x1, y2 - y1) / step))
+        pts.append(np.stack([np.linspace(x1, x2, n), np.linspace(y1, y2, n)], axis=1))
+    return np.concatenate(pts)
+
+
+def coverage(m, tol=0.15):
+    a, (x0, _, y0, _) = grid(m)
+    r = m.info.resolution
+    occ = np.argwhere(a > 50)[:, ::-1] * r + [x0 + r / 2, y0 + r / 2]          # 占据格子的中心坐标 (x, y)
+    wp = wall_points()
+    d_wall = np.array([np.hypot(*(occ - p).T).min() for p in wp])               # 每个真实墙点到最近占据格的距离
+    d_occ = np.array([np.hypot(*(wp - p).T).min() for p in occ])                # 每个占据格到最近真实墙的距离
+    return np.mean(d_wall < tol), np.median(d_occ), np.mean(d_occ > tol)
+
+
+cov, err, ghost = coverage(final)
+print(f"真实墙面被画出来的比例: {cov:.0%}   占据格离真实墙的中位距离: {err * 100:.1f} cm   画在没有墙的地方的占据格: {ghost:.1%}")
+ax = plot_room(title="Final map (black cells) vs. true walls (red)")
+show(ax, final, "Final map vs. true walls (red)")
+for x1, y1, x2, y2 in room_walls():
+    ax.plot([x1, x2], [y1, y2], "r-", lw=1, alpha=.7)
+plt.show()
+
+# %% [markdown]
+# 在真机上没有"真值"可比，但可以用同样的思路做**自洽性检查**：量一下房间的实际尺寸和地图上的尺寸差多少；
+# 走一圈回到原点，看起点和终点的墙有没有"重影"。
+#
+# ## 4. 拆开：规划出的路径
+
+# %%
+fig, ax = plt.subplots(figsize=(7.5, 5.5))
+show(ax, final, "Planned paths on the map")
+for (name, p), c in zip(paths.items(), ("tab:green", "tab:orange", "tab:red", "tab:purple")):
+    s, g = GOALS[name]
+    ax.plot(*g, "*", color=c, ms=14)
+    if p is not None:
+        ax.plot(p[:, 0], p[:, 1], "-", color=c, lw=2, label=f"{name} ({length(p):.1f} m)")
+    else:
+        ax.plot([], [], "*", color=c, label=f"{name} (FAILED)")
+ax.plot(0, 0, "ko", ms=7); ax.legend(fontsize=8, loc="upper left"); plt.show()
+
+# %% [markdown]
+# **先预测再看图：**
+# 1. 目标 B 在隔墙背后，直线距离不到 4 m。路径有多长？它是从隔墙的哪一头绕过去的？
+# 2. 路径贴着墙走了吗？离墙大约多远？这个距离是哪个参数决定的？（看 `config/nav2_planner.yaml` 里的 `robot_radius` 和 `inflation_radius`。）
+# 3. 目标 C 在箱子**里面**，D 在房间**外面**。哪个规划失败了，哪个竟然成功了？成功的那条，路径终点真的到了目标吗（看上面打印的"终点离目标"）？
+#
+# 第 3 问的答案藏在地图的颜色里：箱子内部激光从来照不到，在地图上是**未知**（灰色）而不是"占据"；
+# 而 `config/nav2_planner.yaml` 里写着 `allow_unknown: true`——允许路径进入未知区域——再加上 `tolerance: 0.3`（到不了目标时，允许停在 0.3 m 以内的最近可达点）。
+# 所以规划器并不知道那是个箱子：看图，去 C 的路径特意绕到了箱子**还没被激光照到的那一面**，从那里"钻"了进去。
+# **地图只记录了"看到的"，没看到不等于没有。** 房间外面则超出了地图范围，规划器直接拒绝。
+#
+# 路径不贴墙是因为规划器用的不是地图本身，而是**代价地图（costmap）**：把每个障碍物按机器人半径"吹胖"一圈，
+# 再往外加一圈逐渐衰减的代价。机器人被当成一个点，在吹胖后的地图上找路，自然就离墙有距离了。
+#
+# ### 改坏它
+#
+# 规划是在第 28 秒的那版地图上做的。**预测**：如果在第 3 秒（刚开始建图）就规划去 A，会怎样？
+# 提示：`config/nav2_planner.yaml` 里 `allow_unknown: true`——允许路径穿过"未知"区域。把它改成 `false` 又会怎样？
+# （这个实验要重启规划器，留作课后练习 1。先写下你的预测。）
+#
+# 最后看一个 SLAM 的"副产品"：`map → odom` 这段 TF。它是 SLAM 对里程计漂移的修正量。
+
+# %%
+print("\n".join(l for l in stack.output().splitlines() if "Registering sensor" in l or "Managed nodes are active" in l)[:400])
+_ = sh("ros2 topic list --no-daemon | grep -E '^/(map|scan|odom|tf|clock|plan|global_costmap/costmap)$'")
+stack.stop()
+
+# %% [markdown]
+# 在这段合成数据里里程计没有漂移，所以 `map → odom` 几乎是零；真机的腿式里程计走几十米会漂出几十厘米，这段 TF 就是把它拉回来的那只手。
+#
+# ## 5. 换成 G1
+#
+# 流水线一模一样，`robot:=g1`。G1 的样本数据（`g1_demo`）只往前走了不到 1 米，所以只能建出眼前的一小块——
+# 重点是确认**同一条流水线换个参数就能跑**。
+
+# %%
+maps_g1 = []
+me.create_subscription(OccupancyGrid, "/map", lambda m: maps_g1.append(m), MAP_QOS)
+me.destroy_subscription(map_sub)                        # 不再往 Go2 的 maps 列表里收
+stack = Background(f"exec ros2 launch unitree_lab_nodes stack.launch.py robot:=g1 use_sim_time:={SIM} slam:=true",
+                   log="/tmp/unitree_lab_stack17_g1.log")
+assert stack.wait_for("bridge up", 60), stack.output()
+time.sleep(6.0)
+maps_g1.clear()
+player = None if LIVE else play_bag("g1_demo", extra="--clock")
+spin_for(me, 23.0)
+if player:
+    player.stop()
+stack.stop()
+print(f"G1: 收到 {len(maps_g1)} 版地图")
+if maps_g1:
+    fig, ax = plt.subplots(figsize=(5.5, 4)); show(ax, maps_g1[-1], "G1: map from a short walk"); plt.show()
+me.destroy_node(); lab.close()
+
+# %% [markdown]
+# > **关于 G1 的雷达**：G1 的激光雷达型号、Topic 名和外参，三个官方仓库的源码里都没有给出；这里的 `/utlidar/cloud` 是合成数据沿用了 Go2 的名字。
+# > 真机上请先 `ros2 topic list` 找到点云 Topic，再用 `cloud_to_scan` 的参数 `cloud_topic` 指过去，并提供正确的外参 TF。
+#
+# ## 上真机：从"会规划"到"会走过去"
+#
+# 1. 连真机，启动同一条流水线（`use_sim_time:=false`，不放 bag），用遥控器带着机器人慢慢绕场一圈建图；
+# 2. 在 RViz2 里（`rviz2 -d config/go2.rviz`）看地图是否闭合、有没有重影；
+# 3. 闭环导航需要再启动 Nav2 的控制器和行为树（`controller_server`、`bt_navigator` 等，通常用 `nav2_bringup` 的 `navigation_launch.py`），
+#    它们输出 `/cmd_vel`，由 `robot_bridge`（`enable_motion:=true`）翻译成 `Move` / `SetVelocity`。
+#    **这一步本课程没有在真机上验证过**，详细步骤和要记录的现象见 `docs/real_robot_checklist.md`。第一次请把最大速度限制在 0.3 m/s 以内。
+#
+# ## 小结
+# - 流水线：点云 → `cloud_to_scan` → `/scan` → `slam_toolbox` → `/map` + `map→odom`；需要 `odom→base_link` 和雷达外参两段 TF。
+# - 回放数据建图必须 `--clock` + `use_sim_time:=true`。
+# - 栅格地图 = 二维数组（-1 未知 / 0 空闲 / 100 占据）+ 分辨率 + 原点。
+# - Nav2 规划器是一个 Action；路径离墙的距离由代价地图的膨胀参数决定；未知区域能不能走由 `allow_unknown` 决定。
+#
+# ## 课后练习
+# 1. 把 `config/nav2_planner.yaml` 的 `allow_unknown` 改成 `false`，在建图刚开始 5 秒时规划去 A，再在 30 秒时规划一次。解释两次结果。
+# 2. 把 `inflation_radius` 改成 0.2 和 1.0 各规划一次目标 B，把三条路径画在一起。太小有什么风险？太大呢（提示：隔墙和外墙之间的通道有多宽）？
+# 3. 写 `map_to_png(m, path)`：把 `OccupancyGrid` 存成图片（0/205/254 三种灰度），再写出 Nav2 地图服务器需要的 `.yaml`（`resolution`、`origin` 等字段）。
+#
+# **下一节（最后一节）**：综合实验。感知（激光）、决策（你写的状态机）、控制（`/cmd_vel` → 机器人）连成一条完整的链路。

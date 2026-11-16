@@ -1,0 +1,249 @@
+# %% [markdown]
+# # 10 · G1：让手臂动起来，而腿还站得稳
+#
+# **Part 2 用 SDK2 驱动机器人 · 第 6 节（G1）**
+#
+# 人形机器人最特别的地方：上半身想干活，下半身必须同时保持平衡。Unitree 给了两种控制上肢的方式：
+#
+# | 方式 | 你给什么 | 机器人做什么 | 适合 |
+# |---|---|---|---|
+# | **动作库** `G1ArmActionClient` | 一个动作编号 | 播放预置动作（挥手、握手、拥抱……） | 展示、交互 |
+# | **`rt/arm_sdk`** | 每个上肢关节的目标角 + 一个**权重** | 腿由运控管，手臂听你的 | 自己规划的动作、遥操作、抓取 |
+#
+# 学完你能：
+# 1. 用动作库让 G1 做一个预置动作，并知道哪些动作做完要"释放"；
+# 2. 说清 `rt/arm_sdk` 里第 29 号"电机"的 `q` 为什么是权重，以及权重为什么要渐变；
+# 3. 自己写一段手臂轨迹的发布循环，并与录下的数据逐点对上。
+
+# %%
+LIVE = False
+
+import json
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+
+from common import connect, MotionGate, DATA
+from common.bagio import read_bag
+from common.robots import G1_JOINTS, G1_JOINT_ID, G1_ARM_IDS, G1_WAIST_IDS, G1_ARM_SDK_WEIGHT_ID
+
+lab = connect("g1", live=LIVE, bag=None)
+gate = MotionGate(lab)
+
+# %% [markdown]
+# ## 1. 先跑通：动作库
+#
+# 有哪些预置动作？编号表在 SDK 源码里（`unitree_sdk2py/g1/arm/g1_arm_action_client.py` 的 `action_map`）：
+
+# %%
+from unitree_sdk2py.g1.arm.g1_arm_action_client import G1ArmActionClient, action_map
+
+print({name: i for name, i in sorted(action_map.items(), key=lambda kv: kv[1])})
+
+arm = G1ArmActionClient()
+arm.SetTimeout(10.0)
+arm.Init()
+
+gate.call(arm.ExecuteAction, action_map["high wave"])        # 挥手: 做完自己放下
+
+gate.call(arm.ExecuteAction, action_map["shake hand"])       # 握手: 手会一直举着……
+if gate.will_send: time.sleep(2.0)
+gate.call(arm.ExecuteAction, action_map["release arm"])      # ……直到你释放它
+
+# %% [markdown]
+# **规律**（出处：官方示例 `g1_arm_action_example.py`）：握手、击掌、拥抱、举手这类**保持姿势**的动作，
+# 示例里都在 2 秒后跟一条 `release arm`（编号 99）；挥手、鼓掌这类**自己会结束**的动作则没有。
+# 忘了释放，手臂就一直举着，而且之后运控走路时手臂也不会自然摆动。
+#
+# 这段指令在机器人上的效果，看数据（`g1_demo`，**合成**；其中执行了一次 `high wave`，时刻见下面打印）：
+
+# %%
+bag = read_bag(DATA / "bags" / "g1_demo", ["/api/arm/request", "/lowstate", "/arm_sdk"])
+t0 = bag["/lowstate"][0][0]
+lt = np.array([t for t, _ in bag["/lowstate"]]) - t0
+q = np.array([[m.motor_state[i].q for i in range(29)] for _, m in bag["/lowstate"]])       # (N, 29)
+
+for t, r in bag["/api/arm/request"]:
+    t_wave = t - t0
+    print(f"t={t_wave:.2f} s  api_id={r.header.identity.api_id}  parameter={r.parameter}")
+
+seg = (lt > t_wave - 0.5) & (lt < t_wave + 4.5)
+fig, ax = plt.subplots(figsize=(9, 3))
+for name in ("right_shoulder_pitch", "right_shoulder_roll", "right_elbow", "left_shoulder_pitch"):
+    ax.plot(lt[seg], q[seg, G1_JOINT_ID[name]], label=name)
+ax.axvline(t_wave, color="g", ls="--"); ax.set(xlabel="time [s]", ylabel="rad", title="Arm joints during 'high wave'")
+ax.legend(fontsize=8, ncol=2); ax.grid(alpha=.3); plt.show()
+
+# %% [markdown]
+# **看图回答：** 哪只手在挥？肩膀先抬起（哪个关节），然后哪个关节在来回摆？摆了几个来回？左臂动了吗？
+#
+# ## 2. `rt/arm_sdk`：自己规划手臂
+#
+# 动作库只能播放。想让手臂去**你指定的位置**，要用 `rt/arm_sdk`
+# （出处：`example/g1/high_level/g1_arm7_sdk_dds_example.py`）。它的约定有点特别：
+#
+# - 消息类型是 `unitree_hg` 的 `LowCmd_`（和底层电机指令同一个类型，11 节细讲）；
+# - 你只需要填**上肢 14 个关节 + 腰 3 个关节**的 `q / dq / kp / kd / tau`，腿的不用填；
+# - `motor_cmd[29]` 不是真的电机（G1 只有 0~28），它的 **`q` 被借用来当权重**：
+#   `1` = 上肢完全听你的，`0` = 上肢还给运控。源码里它叫 `kNotUsedJoint`。
+#
+# 先看录下的 `/arm_sdk` 里到底发了什么。
+
+# %%
+at = np.array([t for t, _ in bag["/arm_sdk"]]) - t0
+weight = np.array([m.motor_cmd[G1_ARM_SDK_WEIGHT_ID].q for _, m in bag["/arm_sdk"]])
+J = G1_JOINT_ID["left_shoulder_pitch"]
+q_cmd = np.array([m.motor_cmd[J].q for _, m in bag["/arm_sdk"]])
+kp = bag["/arm_sdk"][0][1].motor_cmd[J].kp; kd = bag["/arm_sdk"][0][1].motor_cmd[J].kd
+print(f"/arm_sdk: {len(at)} 条, 实测约 {1 / np.diff(at).mean():.0f} Hz (代码里写的是每 0.02 s 发一条 = 50 Hz), "
+      f"从 t={at[0]:.1f} s 到 {at[-1]:.1f} s;  kp={kp:.0f} kd={kd:.1f}")
+
+seg = (lt > at[0] - 1) & (lt < at[-1] + 1.5)
+fig, ax = plt.subplots(2, 1, figsize=(9, 4.6), sharex=True)
+ax[0].plot(at, weight, "k"); ax[0].set_ylabel("weight = motor_cmd[29].q"); ax[0].grid(alpha=.3)
+ax[1].plot(at, q_cmd, "r--", label="commanded (arm_sdk)"); ax[1].plot(lt[seg], q[seg, J], label="measured (lowstate)")
+ax[1].set(xlabel="time [s]", ylabel="left_shoulder_pitch [rad]"); ax[1].legend(); ax[1].grid(alpha=.3)
+plt.tight_layout(); plt.show()
+
+# %% [markdown]
+# > 注意打印的频率：代码要的是 50 Hz，录到的却慢一些——录制用的 Python 循环是 `算指令 → 发布 → sleep(0.02)`，
+# > "算指令"本身要花时间，所以每一拍都比 0.02 s 长。**`sleep(dt)` 不等于周期是 `dt`**，下一节会正面处理这个问题。
+#
+# 整个过程分四段，对着上下两张图找出来：
+#
+# 1. **接管**：权重用 0.5 秒从 0 升到 1，同时目标从当前姿态慢慢出发；
+# 2. **运动**：权重保持 1，目标按轨迹走到位，停 1 秒，再走回去；
+# 3. **交还**：目标不动，权重用 1 秒从 1 降到 0；
+# 4. 停止发布。
+#
+# **停一下：** 权重为什么不直接从 0 跳到 1？
+# （权重是"你的目标"和"运控的目标"之间的混合比例。跳变 = 目标瞬间切换 = 关节被猛拉一下。任何时候**目标都不许跳**，这是关节控制的第一原则。）
+#
+# ### 自己写这个发布循环
+#
+# 轨迹插值用公共库的 `common.joints.interpolate`（线性 / 余弦 / 五次多项式三种，11 节会比较它们）。
+# 每一拍做四件事：算目标 → 填 `LowCmd` → **算 CRC** → 发布。
+
+# %%
+from unitree_sdk2py.core.channel import ChannelPublisher
+from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
+from unitree_sdk2py.utils.crc import CRC
+from common.joints import interpolate
+
+ARM_SDK_JOINTS = G1_ARM_IDS + G1_WAIST_IDS            # 14 个上肢关节 + 3 个腰关节
+crc = CRC()
+arm_pub = ChannelPublisher("rt/arm_sdk", LowCmd_)
+arm_pub.Init()
+
+
+def arm_sdk_run(q_rest, q_goal, t_move=2.0, t_hold=1.0, t_in=0.5, t_out=1.0, kp=60.0, kd=1.5, dt=0.02, profile="cosine"):
+    """接管 -> 去 -> 停 -> 回 -> 交还。返回 (t, 权重, 目标角) 的记录，无论是否真的下发。"""
+    cmd = unitree_hg_msg_dds__LowCmd_()
+    log = []
+    total = t_move + t_hold + t_move + t_out
+    for k in range(int(total / dt)):
+        t = k * dt
+        if t < t_move:
+            q, w = interpolate(q_rest, q_goal, t, t_move, profile), min(1.0, t / t_in)
+        elif t < t_move + t_hold:
+            q, w = q_goal, 1.0
+        elif t < 2 * t_move + t_hold:
+            q, w = interpolate(q_goal, q_rest, t - t_move - t_hold, t_move, profile), 1.0
+        else:
+            q, w = q_rest, 1.0 - (t - 2 * t_move - t_hold) / t_out
+        for j in ARM_SDK_JOINTS:
+            m = cmd.motor_cmd[j]
+            m.q, m.dq, m.tau, m.kp, m.kd = float(q[j]), 0.0, 0.0, kp, kd
+        cmd.motor_cmd[G1_ARM_SDK_WEIGHT_ID].q = float(w)
+        cmd.crc = crc.Crc(cmd)                          # 不算 CRC，机器人会直接丢掉这条指令
+        if gate.allow_write("rt/arm_sdk"):
+            arm_pub.Write(cmd)
+            time.sleep(dt)
+        log.append((t, w, q.copy()))
+    return np.array([l[0] for l in log]), np.array([l[1] for l in log]), np.array([l[2] for l in log])
+
+
+# 起点: 手臂自然下垂的姿态 (取自录制数据里 arm_sdk 开始前一刻的实测关节角)
+q_rest = np.zeros(29)
+q_rest[ARM_SDK_JOINTS] = np.round(q[np.searchsorted(lt, at[0]) - 5, ARM_SDK_JOINTS], 2)
+q_goal = q_rest.copy()
+q_goal[G1_JOINT_ID["left_shoulder_pitch"]] = -1.2       # 左肩前抬
+q_goal[G1_JOINT_ID["left_elbow"]] = 0.2                 # 肘伸直一些
+
+pt, pw, pq = arm_sdk_run(q_rest, q_goal)
+print(f"规划了 {len(pt)} 拍, 共 {pt[-1]:.1f} s")
+
+# %% [markdown]
+# 没有真机，指令没发出去——但我们算出的每一拍目标都记下来了。**把它和录制数据里的 `/arm_sdk` 逐拍叠在一起**，检查你写的循环对不对
+# （横轴用"第几拍"而不是时间，因为上面看到了：录制时每一拍的实际间隔并不正好是 0.02 s）：
+
+# %%
+fig, ax = plt.subplots(figsize=(9, 2.8))
+n = min(len(pt), len(q_cmd))
+ax.plot(np.arange(n), q_cmd[:n], "r", lw=3, alpha=.4, label="recorded /arm_sdk")
+ax.plot(np.arange(n), pq[:n, J], "k--", lw=1, label="my loop (planned)")
+ax.set(xlabel="control tick (one tick = one message)", ylabel="left_shoulder_pitch target [rad]"); ax.legend(); ax.grid(alpha=.3); plt.show()
+print(f"两条目标曲线的最大差: {np.abs(pq[:n, J] - q_cmd[:n]).max():.3f} rad")
+
+# %% [markdown]
+# ### 拆开：权重到底是怎么"混"的
+#
+# 假设混合规则是 `实际目标 = (1 - w) × 运控的目标 + w × 你的目标`。用**交还阶段**的数据检验：
+# 这一段你的目标不动（= `q_rest`），权重从 1 降到 0，如果运控的目标恰好也是 `q_rest`，那关节应该**纹丝不动**。
+
+# %%
+handing_back = np.flatnonzero((weight < 0.999) & (np.arange(len(weight)) > len(weight) // 2))     # 权重开始下降之后
+seg = (lt > at[handing_back[0]]) & (lt < at[handing_back[-1]])
+print(f"交还阶段 (权重 1 -> 0) 左肩角度变化范围: {q[seg, J].min():+.3f} ~ {q[seg, J].max():+.3f} rad")
+
+# %% [markdown]
+# 几乎不动——因为我们特意让手臂**先回到自然下垂的姿态再交还**。如果在手举着的时候就把权重降下来，
+# 手臂会被运控"接"回它想要的位置，速度取决于权重降得多快。所以：**先回位，再交还。**
+#
+# （合成数据是按上面的混合规则生成的；真机内部的混合方式官方源码里看不到——这是一条真机待验项：
+# 举着手把权重降到 0.5，看关节是否停在中间。）
+#
+# ## 3. 改坏它：三种插值，谁会"抖"
+#
+# `arm_sdk_run` 的 `profile` 可以换成 `"linear"`。**预测**：线性插值的目标曲线在起点和终点处，速度有什么问题？
+
+# %%
+fig, ax = plt.subplots(1, 2, figsize=(10, 2.8))
+for profile in ("linear", "cosine", "minjerk"):
+    t_, _, q_ = arm_sdk_run(q_rest, q_goal, profile=profile)
+    ax[0].plot(t_, q_[:, J], label=profile)
+    ax[1].plot(t_, np.gradient(q_[:, J], t_), label=profile)
+ax[0].set(title="target position [rad]", xlabel="s"); ax[1].set(title="target velocity [rad/s]", xlabel="s")
+[a.legend(fontsize=8) or a.grid(alpha=.3) for a in ax]; plt.tight_layout(); plt.show()
+
+# %% [markdown]
+# 线性插值的速度是"方波"：出发瞬间速度从 0 跳到 0.6 rad/s。位置没跳，但**速度跳了 = 加速度无穷大 = 电机猛地一顿**。
+# 余弦和五次多项式的速度从 0 平滑升起。官方示例为了简单用的是线性，本课程公共库默认余弦。
+#
+# ## 和 Go2 对比
+#
+# Go2 没有手臂，最接近的东西是 `SportClient.Euler(roll, pitch, yaw)`——让机身摆个姿态而腿继续站着。
+# 思想是一样的：**上层给"我想要的姿态"，平衡仍由运控负责**。区别是 G1 把这个接口开放到了关节级。
+#
+# ## 上真机怎么跑
+# ```python
+# LIVE = True
+# gate.confirm("我已清场并手握急停")
+# # G1 须处于主运控 (09 节的 Start 之后) 且站稳；手臂活动范围内没有人和物
+# arm_sdk_run(q_rest_from_live_state, q_goal)        # q_rest 必须取自**此刻**的 LowState，而不是本页的常数
+# ```
+# 第一次：把 `q_goal` 的幅度减半（肩 -0.6），`t_move` 加倍。
+#
+# ## 小结
+# - 动作库：`ExecuteAction(编号)`；保持类动作做完要 `release arm`（99）。
+# - `rt/arm_sdk`：上肢 + 腰共 17 个关节听你的，`motor_cmd[29].q` 是权重；**权重渐变、目标不跳、先回位再交还**。
+# - 每条 `LowCmd` 发之前都要算 CRC。
+# - 用"录制数据里的指令"核对"我的代码算出的指令"，是没有真机时验证控制代码的办法。
+#
+# ## 课后练习
+# 1. 规划"双臂前平举"：左右肩 pitch 同时到 -1.5。画出规划的目标曲线。右肩 roll 的符号要不要变？（看 `common/robots.py` 里左右肩 roll 限位的符号。）
+# 2. 用 `common.joints.clamp_to_limits` 检查你的 `q_goal` 有没有越界；故意给一个越界的目标看它报告哪些关节被夹住。
+# 3. `arm_sdk_run` 的起点 `q_rest` 是写死的。改写成从 `rt/lowstate` 读取当前关节角作为起点。为什么这在真机上是**必须**的？
+#
+# **下一节**：`rt/arm_sdk` 让你控制了上肢的目标角。再往下一层：直接给**每一个电机**发位置、速度、力矩指令——并且没有运控帮你兜底。

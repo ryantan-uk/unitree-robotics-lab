@@ -1,0 +1,4 @@
+# 本仓库不需要 pip 安装: scripts/install.sh 用一个 .pth 文件把仓库根目录加入 Python 路径。
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider -p no:anyio"

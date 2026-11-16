@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>unitree_lab_cpp</name>
+  <version>0.1.0</version>
+  <description>C++ 对照示例: 用 rclcpp 读 Go2 / G1 的 LowState</description>
+  <maintainer email="lab@example.com">unitree-robotics-lab</maintainer>
+  <license>BSD-3-Clause</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>unitree_go</depend>
+  <depend>unitree_hg</depend>
+  <depend>unitree_api</depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

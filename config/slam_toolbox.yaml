@@ -1,0 +1,32 @@
+# slam_toolbox (在线异步建图) 参数。基于 slam_toolbox 自带的 mapper_params_online_async.yaml，只列出改动和关键项。
+slam_toolbox:
+  ros__parameters:
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link          # 与 robot_bridge 的 base_frame 一致
+    scan_topic: /scan              # cloud_to_scan 的输出
+    mode: mapping
+
+    resolution: 0.05               # 地图分辨率 [m/格]
+    max_laser_range: 10.0
+    minimum_time_interval: 0.2
+    transform_timeout: 0.5
+    tf_buffer_duration: 30.0
+    map_update_interval: 2.0       # 每 2 s 发布一次 /map
+    transform_publish_period: 0.05 # 发布 map -> odom
+
+    use_scan_matching: true
+    minimum_travel_distance: 0.2   # 走 0.2 m 或转 0.2 rad 才加一个关键帧
+    minimum_travel_heading: 0.2
+    do_loop_closing: true
+    debug_logging: false
+    throttle_scans: 1
+    stack_size_to_use: 40000000
+    enable_interactive_mode: false

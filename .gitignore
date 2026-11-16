@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.egg-info/
+build/
+install/
+log/
+config/cyclonedds.env
+config/cyclonedds.xml
+config/local_paths.env
+_out/
+.pytest_cache/

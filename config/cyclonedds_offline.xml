@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 离线模式: DDS 只走本机回环 lo，数据来自 Rosbag 回放。不会碰到真机。
+     回环网卡不支持组播，所以发现靠 "向 localhost 的一串端口单播"；
+     MaxAutoParticipantIndex 决定同一台机器上最多能有多少个 DDS 参与者 (默认只有 10 个，
+     Nav2 一启动就不够用)。 -->
+<CycloneDDS>
+  <Domain Id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="lo" multicast="false"/>
+      </Interfaces>
+      <AllowMulticast>false</AllowMulticast>
+    </General>
+    <Discovery>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <MaxAutoParticipantIndex>120</MaxAutoParticipantIndex>
+      <Peers>
+        <Peer address="localhost"/>
+      </Peers>
+    </Discovery>
+  </Domain>
+</CycloneDDS>

@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>unitree_lab_nodes</name>
+  <version>0.1.0</version>
+  <description>课程节点: 桥接、状态聚合、点云转激光、姿态 Action、巡逻控制</description>
+  <maintainer email="lab@example.com">unitree-robotics-lab</maintainer>
+  <license>BSD-3-Clause</license>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>unitree_go</exec_depend>
+  <exec_depend>unitree_hg</exec_depend>
+  <exec_depend>unitree_api</exec_depend>
+  <exec_depend>unitree_lab_interfaces</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>diagnostic_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

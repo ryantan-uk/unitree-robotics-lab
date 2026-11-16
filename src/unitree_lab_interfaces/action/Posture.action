@@ -1,0 +1,13 @@
+# 目标: 让机器人到达某个姿态。Go2: "stand" / "lie"；G1: "stand" / "squat"
+string posture
+float32 timeout 8.0
+---
+# 结果
+bool success
+string message
+float32 final_height     # 结束时的机身高度 [m]
+float32 elapsed          # 用时 [s]
+---
+# 反馈 (过程中持续发)
+float32 height           # 当前机身高度 [m]
+float32 progress         # 0..1

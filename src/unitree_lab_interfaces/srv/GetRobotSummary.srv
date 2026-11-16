@@ -1,0 +1,9 @@
+# 请求: 无
+---
+string robot            # "go2" / "g1"
+bool upright            # 倾角是否小于阈值
+float32 tilt_deg        # 机身倾角
+float32 height          # 机身高度 [m]
+float32 max_motor_temp  # 最热电机温度 [degC]
+string hottest_motor    # 最热电机的名字
+float32 battery_soc     # 电量百分比 (G1 的 LowState 不含电池信息，填 -1)

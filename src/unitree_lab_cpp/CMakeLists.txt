@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.8)
+project(unitree_lab_cpp)
+if(NOT CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 17)
+endif()
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(unitree_go REQUIRED)
+find_package(unitree_hg REQUIRED)
+find_package(unitree_api REQUIRED)
+
+add_executable(lowstate_reader src/lowstate_reader.cpp)
+ament_target_dependencies(lowstate_reader rclcpp unitree_go unitree_hg)
+
+add_executable(sport_request src/sport_request.cpp)
+ament_target_dependencies(sport_request rclcpp unitree_api)
+
+install(TARGETS lowstate_reader sport_request DESTINATION lib/${PROJECT_NAME})
+ament_package()

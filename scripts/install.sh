@@ -128,6 +128,12 @@ for p in "$REPO"/src/*/; do
   [ -f "$p/package.xml" ] && ln -sfn "${p%/}" "$WS/src/$(basename "$p")"
 done
 set +u; source /opt/ros/humble/setup.bash; set -u
+# 工作空间如果是用旧方式 (非 --symlink-install) 编译的，两种方式混用会编译失败，先清掉重来
+if [ -d "$WS/build" ] && [ ! -f "$WS/.symlink_install" ]; then
+  echo "  检测到旧的编译产物，清理后重新编译"
+  rm -rf "$WS/build" "$WS/install" "$WS/log"
+fi
+touch "$WS/.symlink_install"
 # --symlink-install: 改了 src/ 里的 Python 节点立即生效，不用重新编译
 ( cd "$WS" && colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
     --event-handlers console_cohesion+ status- 2>&1 | grep -vE "^\s*$" | tail -n 25 )
